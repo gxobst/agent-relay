@@ -98,7 +98,7 @@ jobs:
           kubectl version --client=true
       - name: Load image and create cluster
         run: |
-          kind create cluster --name ci --config k8s/kind-config.yaml --wait 300s
+          kind create cluster --name ci --config .github/kind-config.yaml --wait 300s
           kind load docker-image "$IMAGE_REF" --name ci
       - name: Point kubeconfig at reachable API (act on Docker Desktop)
         # act sets ACT=true in job containers. A kind cluster created inside
