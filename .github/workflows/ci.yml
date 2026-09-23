@@ -85,6 +85,8 @@ jobs:
       - name: Install kind and kubectl
         run: |
           mkdir -p "$HOME/.local/bin"
+          # GITHUB_PATH only affects *later* steps — export for this one too.
+          export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           curl -LsS -o "$HOME/.local/bin/kind" \
             https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
