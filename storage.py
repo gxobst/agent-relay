@@ -2,8 +2,8 @@
 
 Routes and the worker call these functions instead of issuing SQL directly.
 Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+transaction seam from :mod:`database`: ``BEGIN IMMEDIATE`` serialization on
+SQLite, row locking (``FOR UPDATE`` / ``SKIP LOCKED``) on PostgreSQL.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from database import (
     iso_time,
     recover_expired,
     recover_expired_in_session,
+    using_row_locking,
     utcnow,
 )
 from errors import RelayError
@@ -144,12 +145,17 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
-        task = db.scalar(
+        claim_stmt = (
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
             .limit(1)
         )
+        if using_row_locking():
+            # A locked-by-another-claimer row is skipped instead of waited
+            # on, so concurrent workers never claim the same task.
+            claim_stmt = claim_stmt.with_for_update(skip_locked=True)
+        task = db.scalar(claim_stmt)
         if task is None:
             return None
         if task.attempt_count >= MAX_ATTEMPTS:

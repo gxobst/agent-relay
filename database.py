@@ -1,9 +1,11 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models (SQLite or PostgreSQL).
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows backend-specific
+details: SQLite connection pragmas and its ``BEGIN IMMEDIATE`` writer-lock
+transaction versus PostgreSQL row locking (``SELECT ... FOR UPDATE`` /
+``SKIP LOCKED`` on the contended selects in :mod:`storage`).  Set
+``RELAY_DATABASE_URL`` or ``DATABASE_URL`` to a ``postgresql+psycopg://`` URL
+to run on PostgreSQL; the default remains the local SQLite file.
 """
 
 from __future__ import annotations
@@ -175,21 +177,33 @@ def db_session() -> Generator[Session, None, None]:
         db.close()
 
 
+def using_row_locking() -> bool:
+    """True when the engine supports ``SELECT ... FOR UPDATE`` (PostgreSQL).
+
+    SQLite has no row locking, so writers there serialize through the
+    ``BEGIN IMMEDIATE`` reservation in :func:`immediate_transaction` instead.
+    """
+
+    return engine.dialect.name != "sqlite"
+
+
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On SQLite a ``BEGIN IMMEDIATE`` writer reservation serializes claims (and
+    recovery or terminal submissions) across API processes, giving each task
+    one active lease.  On PostgreSQL this is a regular transaction and the
+    contended selects add their own row locking (``FOR UPDATE`` /
+    ``SKIP LOCKED`` — see :func:`using_row_locking` callers in
+    :mod:`storage`).
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if connection.dialect.name == "sqlite":
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -205,13 +219,14 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    expired_stmt = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if using_row_locking():
+        expired_stmt = expired_stmt.with_for_update()
+    expired = list(db.scalars(expired_stmt))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
@@ -260,5 +275,6 @@ __all__ = [
     "iso_time",
     "recover_expired",
     "recover_expired_in_session",
+    "using_row_locking",
     "utcnow",
 ]

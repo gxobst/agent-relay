@@ -1,0 +1,35 @@
+# Agent Relay + PostgreSQL.
+#
+#   docker compose up -d --build
+#
+# The relay reads RELAY_DATABASE_URL/DATABASE_URL (see database.py) and
+# creates its tables on startup, so no manual migration is needed. The app
+# image already binds uvicorn to 0.0.0.0, which is what makes the published
+# port reachable from the host.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: relay
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+    volumes:
+      - relay-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  relay:
+    build: .
+    ports:
+      - "18481:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  relay-pgdata:

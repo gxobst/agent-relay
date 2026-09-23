@@ -1,0 +1,58 @@
+# Agent Relay API: Deployment + Service.
+#
+# The image is built locally (docker build -t agent-relay:local .) and loaded
+# into kind (kind load docker-image agent-relay:local --name agent-relay), so
+# it is never pulled from a registry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  labels:
+    app: relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: relay
+  template:
+    metadata:
+      labels:
+        app: relay
+    spec:
+      containers:
+        - name: relay
+          image: agent-relay:local
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: postgresql+psycopg://relay:relay@postgres:5432/relay
+          readinessProbe:
+            # /ready checks the real tables, so the pod only goes ready once
+            # PostgreSQL is reachable and migrated.
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+  labels:
+    app: relay
+spec:
+  type: ClusterIP
+  selector:
+    app: relay
+  ports:
+    - port: 8000
+      targetPort: 8000
