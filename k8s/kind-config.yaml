@@ -1,0 +1,10 @@
+# kind cluster config shared by CI (GitHub runners) and local `act` runs.
+#
+# apiServerAddress 0.0.0.0 publishes the API port on all host interfaces
+# instead of loopback-only. On Docker Desktop that is what makes the API
+# reachable from inside sibling containers via host.docker.internal (the
+# kubeconfig server is then rewritten to that host — see ci.yml).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  apiServerAddress: 0.0.0.0

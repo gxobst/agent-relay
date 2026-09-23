@@ -1,0 +1,176 @@
+# CI: starter tests (SQLite) + integration tests (PostgreSQL), then build
+# the Docker image and deploy it to a kind cluster — the deploy only runs
+# when both test jobs pass (via `needs:`).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Unique image tag per version (commit SHA): every build/rollout below
+# references this exact image, never a floating tag.
+env:
+  IMAGE_REF: agent-relay:ci-${{ github.sha }}
+
+jobs:
+  test-sqlite:
+    name: Starter tests (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync dependencies
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          uv sync --frozen
+      - name: Run starter suite
+        run: uv run pytest test_agent_relay.py -q
+
+  test-postgres:
+    name: Integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: relay
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync dependencies
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          uv sync --frozen
+      - name: Start relay on PostgreSQL
+        run: |
+          DATABASE_URL=postgresql+psycopg://relay:relay@localhost:5432/relay \
+            uv run uvicorn main:app --port 8000 > /tmp/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/ready > /dev/null; then
+              echo "relay ready"; break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/ready || (cat /tmp/uvicorn.log; exit 1)
+      - name: Run integration tests against PostgreSQL
+        run: |
+          RELAY_DOCKER_BASE_URL=http://127.0.0.1:8000 \
+          RELAY_LIVE_BASE_URL=http://127.0.0.1:8000 \
+            uv run pytest test_container_flow_live.py test_dashboard_flow_live.py -v
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: [test-sqlite, test-postgres]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t "$IMAGE_REF" .
+      - name: Save image for kind job
+        run: docker save -o /tmp/agent-relay.tar "$IMAGE_REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-relay-image
+          path: /tmp/agent-relay.tar
+          retention-days: 1
+
+  deploy-kind:
+    name: Deploy to kind
+    runs-on: ubuntu-latest
+    needs: [test-sqlite, test-postgres, build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-relay-image
+          path: /tmp
+      - name: Install kind and kubectl
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -LsS -o "$HOME/.local/bin/kind" \
+            https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-amd64
+          chmod +x "$HOME/.local/bin/kind"
+          curl -LsS -o "$HOME/.local/bin/kubectl" \
+            "https://dl.k8s.io/release/$(curl -LsS https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+          kind version
+          kubectl version --client=true
+      - name: Load image and create cluster
+        run: |
+          docker load -i /tmp/agent-relay.tar
+          kind create cluster --name ci --config k8s/kind-config.yaml --wait 300s
+          kind load docker-image "$IMAGE_REF" --name ci
+      - name: Point kubeconfig at reachable API (act on Docker Desktop)
+        # act sets ACT=true in job containers. A kind cluster created inside
+        # such a container publishes its API on the *host*; the kubeconfig's
+        # loopback address only works from the host itself, so rewrite it to
+        # host.docker.internal (TLS cannot verify that name — local only).
+        if: env.ACT == 'true'
+        run: |
+          CLUSTER="$(kubectl config view --minify -o jsonpath='{.clusters[0].name}')"
+          SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+          kubectl config set-cluster "$CLUSTER" \
+            --server="https://host.docker.internal:${SERVER##*:}" \
+            --insecure-skip-tls-verify=true
+          kubectl get nodes
+      - name: Deploy manifests and roll out new image
+        run: |
+          kubectl apply -f k8s/
+          kubectl set image deployment/relay relay="$IMAGE_REF"
+          kubectl rollout status deployment/relay --timeout=180s
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=180s
+          kubectl get pods
+      - name: Smoke-test task flow through port-forward
+        run: |
+          kubectl port-forward svc/relay 8000:8000 > /tmp/pf.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/ready > /dev/null; then break; fi
+            sleep 2
+          done
+          python3 - <<'EOF'
+          import json, urllib.request
+
+          BASE = "http://127.0.0.1:8000"
+
+          def call(method, path, body=None, token=None):
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              req = urllib.request.Request(
+                  BASE + path,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers=headers, method=method,
+              )
+              with urllib.request.urlopen(req) as r:
+                  return r.status, json.loads(r.read() or b"{}")
+
+          _, sender = call("POST", "/api/v1/agents", {"name": "ci-alice"})
+          _, recipient = call("POST", "/api/v1/agents", {"name": "ci-bob"})
+          _, sent = call("POST", "/api/v1/tasks",
+                         {"to": recipient["agent_id"], "input": "ci smoke"},
+                         sender["token"])
+          assert sent["status"] == "queued", sent
+          _, claim = call("POST", "/api/v1/tasks/claim",
+                          {"worker_id": "ci", "wait_seconds": 5}, recipient["token"])
+          assert claim["task_id"] == sent["task_id"], claim
+          _, done = call("POST", f"/api/v1/tasks/{sent['task_id']}/complete",
+                         {"claim_token": claim["claim_token"], "output": "ci ok"},
+                         recipient["token"])
+          assert done["status"] == "completed", done
+          _, got = call("GET", f"/api/v1/tasks/{sent['task_id']}", None, sender["token"])
+          assert got["status"] == "completed" and got["output"] == "ci ok", got
+          print("kind smoke flow OK:", got["task_id"], got["status"])
+          EOF
